@@ -1,3 +1,5 @@
+## Brief
+
 I want to create a simple agent that will surface job opportunities for me. 
 
 I want to use LinkedIn and https://www.aijobsaustralia.com.au/jobs?location=brisbane to start with
@@ -9,7 +11,5 @@ Phase 1 will just be a daily email that alerts me of these new jobs and how appl
 
 
 
-
-
-
-
+## Considerations
+Deduping across sources
