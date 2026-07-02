@@ -6,6 +6,11 @@ account_id = "e2ca6e9ea4072fe37dbb20adff068dab"
 [vars]
 SENDER_EMAIL = "notifications@vatican-ticket-notifications.com"
 RECIPIENT_EMAIL = "rees@fucius.ai"
+JOB_FINDER_ADMIN_URL = "https://job-finder-agent.rees-e2c.workers.dev/admin"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 [triggers]
 # Cloudflare cron uses UTC. 22:00 UTC = 08:00 Australia/Brisbane.

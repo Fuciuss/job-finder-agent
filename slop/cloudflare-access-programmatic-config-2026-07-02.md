@@ -90,3 +90,71 @@ Use these checks instead of a startup health check:
 - Cron self-check: scheduled Worker pings Healthchecks.io.
 - Deep protected status: `/admin/status` checks D1, last scan, last email, and last error.
 - Cron start ping: ping Healthchecks.io `/start` at the beginning of every scheduled job.
+
+## Current implementation
+
+The deployed Worker is reachable at:
+
+```text
+https://job-finder-agent.rees-e2c.workers.dev
+```
+
+Public route:
+
+```text
+/health
+```
+
+Protected routes:
+
+```text
+/admin/*
+/api/admin/*
+/api/run-scan
+```
+
+The repo has a Cloudflare API script for this:
+
+```bash
+npm run access:plan
+CLOUDFLARE_API_TOKEN=... npm run access:configure
+```
+
+Status on 2026-07-02:
+
+- `npm run access:plan` works and prints the intended Access app payload.
+- `npm run access:configure` has not been applied yet because the local shell/project env does not currently have `CLOUDFLARE_API_TOKEN`.
+- The API token needs permission to create/update Cloudflare Zero Trust Access applications and policies for the `rees@fucius.ai` account.
+
+The script lives at:
+
+```text
+scripts/cloudflare/configure-access.mjs
+```
+
+It creates or updates one Access self-hosted application named `Job Finder Agent Admin`. It uses public destinations with path wildcards:
+
+```text
+job-finder-agent.rees-e2c.workers.dev/admin/*
+job-finder-agent.rees-e2c.workers.dev/api/admin/*
+job-finder-agent.rees-e2c.workers.dev/api/run-scan
+```
+
+Allowed identity is currently:
+
+```text
+rees@fucius.ai
+```
+
+Config knobs:
+
+```bash
+ACCESS_HOSTNAME=jobs.example.com
+ACCESS_ALLOWED_EMAILS=rees@fucius.ai,other@example.com
+ACCESS_PATHS=/admin/*,/api/admin/*,/api/run-scan
+ACCESS_SESSION_DURATION=24h
+ACCESS_APP_NAME="Job Finder Agent Admin"
+WORKERS_DEV_SUBDOMAIN=rees-e2c
+```
+
+Important: Wrangler's OAuth token is enough for Worker/D1 deploys, but not a clean repo-controlled Zero Trust automation path. Use a dedicated Cloudflare API token for this script.

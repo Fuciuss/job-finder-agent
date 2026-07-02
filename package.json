@@ -12,7 +12,9 @@
     "db:generate": "bash scripts/cloudflare/generate-d1-migration.sh",
     "db:migrate:local": "bash scripts/cloudflare/apply-d1-migrations.sh local",
     "db:migrate:remote": "bash scripts/cloudflare/apply-d1-migrations.sh remote",
-    "db:migrations": "bash scripts/cloudflare/list-d1-migrations.sh remote"
+    "db:migrations": "bash scripts/cloudflare/list-d1-migrations.sh remote",
+    "access:plan": "DRY_RUN=1 node scripts/cloudflare/configure-access.mjs",
+    "access:configure": "node scripts/cloudflare/configure-access.mjs"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.2"

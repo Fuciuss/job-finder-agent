@@ -1,21 +1,66 @@
-import { desc, sql } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
+import type { DrizzleD1Database } from "drizzle-orm/d1";
 
+import { renderAdminErrorPage, renderAdminPage, type AdminStatusData } from "./admin/page.js";
 import { createDatabase, type AppEnv } from "./db/client.js";
 import * as schema from "./db/schema.js";
+import { sendJobDigest, type SendJobDigestResult } from "./email/digest.js";
+import { sendFailureEmail, type SendFailureEmailResult } from "./email/errors.js";
 import { sendEmail } from "./email/resend.js";
-import { createJobRun, finishJobRun } from "./jobs/ingest.js";
+import { assessUnprocessedListings, type AssessUnprocessedListingsResult } from "./jobs/assess.js";
+import { sourceKeys } from "./jobs/compute.js";
+import {
+  createJobRun,
+  finishJobRun,
+  ingestAiJobsAustraliaItems,
+  ingestLinkedInItems,
+  type IngestBatchResult,
+} from "./jobs/ingest.js";
+import {
+  aiJobsAustraliaQueryPayload,
+  fetchAiJobsAustraliaApprovedJobs,
+} from "./sources/aijobs-australia.js";
+import {
+  DEFAULT_LINKEDIN_QUERIES,
+  DEFAULT_LINKEDIN_LOCATIONS,
+  fetchLinkedInJobsForLocation,
+  linkedInCityQueryPayload,
+} from "./sources/linkedin.js";
 
 type Env = AppEnv;
+type AppDatabase = DrizzleD1Database<typeof schema>;
+
+const SERVICE_NAME = "job-finder-agent";
 
 type DailyJobMonitorTrigger = "cron" | "manual";
 
+type SourceRunSummary = {
+  ok: boolean;
+  sourceKey: string;
+  purpose: string;
+  location: string | null;
+  runId: string;
+  rawCount?: number;
+  filteredCount?: number;
+  newCount?: number;
+  changedCount?: number;
+  unchangedCount?: number;
+  error?: string;
+};
+
 type DailyJobMonitorResult = {
   ok: boolean;
-  status: "not_implemented";
-  runId: string;
+  status: "completed" | "completed_with_errors";
   trigger: DailyJobMonitorTrigger;
   startedAt: string;
   scheduledTime?: string;
+  sourceRuns: SourceRunSummary[];
+  assessment?: AssessUnprocessedListingsResult;
+  assessmentError?: string;
+  emailDigest?: SendJobDigestResult;
+  emailDigestError?: string;
+  failureEmail?: SendFailureEmailResult;
+  failureEmailError?: string;
   message: string;
 };
 
@@ -29,8 +74,36 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   });
 }
 
+function htmlResponse(body: string, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  headers.set("content-type", "text/html; charset=utf-8");
+
+  return new Response(body, {
+    ...init,
+    headers,
+  });
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function logInfo(event: string, fields: Record<string, unknown> = {}): void {
+  console.log({
+    level: "info",
+    service: SERVICE_NAME,
+    event,
+    ...fields,
+  });
+}
+
+function logError(event: string, fields: Record<string, unknown> = {}): void {
+  console.error({
+    level: "error",
+    service: SERVICE_NAME,
+    event,
+    ...fields,
+  });
 }
 
 async function runDailyJobMonitor(
@@ -38,6 +111,7 @@ async function runDailyJobMonitor(
   input: {
     trigger: DailyJobMonitorTrigger;
     scheduledTime?: number;
+    adminUrl?: string;
   },
 ): Promise<DailyJobMonitorResult> {
   const db = createDatabase(env);
@@ -45,48 +119,331 @@ async function runDailyJobMonitor(
   const scheduledTime = input.scheduledTime
     ? new Date(input.scheduledTime).toISOString()
     : undefined;
-  const run = await createJobRun(
-    db,
-    {
-      sourceKey: "daily_monitor",
-      purpose: "daily-job-monitor",
-      location: null,
-      queryPayload: {
-        trigger: input.trigger,
-        scheduledTime,
+  const startedMs = Date.now();
+
+  logInfo("daily_job_monitor_started", {
+    trigger: input.trigger,
+    startedAt: startedAt.toISOString(),
+    scheduledTime,
+  });
+
+  const sourceRuns: SourceRunSummary[] = [];
+  sourceRuns.push(await runAiJobsAustralia(db, env));
+
+  for (const location of DEFAULT_LINKEDIN_LOCATIONS) {
+    sourceRuns.push(await runLinkedInCity(db, env, location));
+  }
+
+  let assessment: AssessUnprocessedListingsResult | undefined;
+  let assessmentError: string | undefined;
+
+  try {
+    assessment = await assessUnprocessedListings(db, {
+      openRouter: {
+        apiKey: env.JOB_FINDER_OPENROUTER_API_KEY,
+        model: env.JOB_FINDER_OPENROUTER_MODEL,
+        maxAssessments: parseOptionalInteger(env.JOB_FINDER_OPENROUTER_MAX_ASSESSMENTS),
+        minDeterministicScore: parseOptionalInteger(env.JOB_FINDER_OPENROUTER_MIN_RULE_SCORE),
       },
-    },
-    startedAt,
-  );
+    });
+    logInfo("job_assessment_completed", {
+      assessedCount: assessment.assessedCount,
+      llmAssessedCount: assessment.llmAssessedCount,
+      llmSkippedCount: assessment.llmSkippedCount,
+      llmErrorCount: assessment.llmErrorCount,
+      labels: assessment.labels,
+    });
+  } catch (error) {
+    assessmentError = errorMessage(error);
+    logError("job_assessment_failed", { error: assessmentError });
+  }
 
-  console.log("daily job monitor triggered", {
+  let emailDigest: SendJobDigestResult | undefined;
+  let emailDigestError: string | undefined;
+
+  if (!assessmentError) {
+    try {
+      emailDigest = await sendJobDigest(db, env, {
+        maxItems: parseOptionalInteger(env.JOB_FINDER_DIGEST_MAX_ITEMS),
+        adminUrl: input.adminUrl ?? env.JOB_FINDER_ADMIN_URL,
+        sourceSummary: {
+          sourceRunCount: sourceRuns.length,
+          jobSearchQueryCount: countJobSearchQueries(sourceRuns),
+          llmAssessmentCount: assessment?.llmAssessedCount ?? 0,
+          newCount: sumSourceRuns(sourceRuns, "newCount"),
+          changedCount: sumSourceRuns(sourceRuns, "changedCount"),
+          failedSourceRunCount: sourceRuns.filter((runResult) => !runResult.ok).length,
+        },
+      });
+      logInfo("job_digest_completed", emailDigest);
+    } catch (error) {
+      emailDigestError = errorMessage(error);
+      logError("job_digest_failed", { error: emailDigestError });
+    }
+  }
+
+  const ok =
+    sourceRuns.every((runResult) => runResult.ok) && !assessmentError && !emailDigestError;
+  const result: DailyJobMonitorResult = {
+    ok,
+    status: ok ? "completed" : "completed_with_errors",
     trigger: input.trigger,
-    runId: run.id,
     startedAt: startedAt.toISOString(),
     scheduledTime,
+    sourceRuns,
+    assessment,
+    assessmentError,
+    emailDigest,
+    emailDigestError,
+    message: ok
+      ? "Daily job monitor completed."
+      : "Daily job monitor completed with one or more source, assessment, or email errors.",
+  };
+
+  if (!result.ok) {
+    const notification = await sendFailureNotification(env, {
+      trigger: result.trigger,
+      status: result.status,
+      startedAt: result.startedAt,
+      scheduledTime: result.scheduledTime,
+      finishedAt: new Date().toISOString(),
+      sourceRuns: result.sourceRuns,
+      assessmentError: result.assessmentError,
+      emailDigestError: result.emailDigestError,
+      message: result.message,
+    });
+    result.failureEmail = notification.failureEmail;
+    result.failureEmailError = notification.failureEmailError;
+  }
+
+  logInfo("daily_job_monitor_completed", {
+    ok: result.ok,
+    status: result.status,
+    trigger: result.trigger,
+    durationMs: Date.now() - startedMs,
+    sourceRunCount: sourceRuns.length,
+    failedSourceRunCount: sourceRuns.filter((runResult) => !runResult.ok).length,
+    newCount: sumSourceRuns(sourceRuns, "newCount"),
+    changedCount: sumSourceRuns(sourceRuns, "changedCount"),
+    unchangedCount: sumSourceRuns(sourceRuns, "unchangedCount"),
+    jobSearchQueryCount: countJobSearchQueries(sourceRuns),
+    assessedCount: assessment?.assessedCount ?? 0,
+    llmAssessmentCount: assessment?.llmAssessedCount ?? 0,
+    digestStatus: emailDigest?.status,
+    digestItemCount: emailDigest?.itemCount ?? 0,
+    failureEmailStatus: result.failureEmail?.status,
+    failureEmailError: result.failureEmailError,
   });
 
-  await finishJobRun(db, run.id, {
+  return result;
+}
+
+async function sendFailureNotification(
+  env: Env,
+  input: Parameters<typeof sendFailureEmail>[1],
+): Promise<{
+  failureEmail?: SendFailureEmailResult;
+  failureEmailError?: string;
+}> {
+  try {
+    const failureEmail = await sendFailureEmail(env, input);
+    logInfo("failure_email_completed", {
+      status: failureEmail.status,
+      reason: failureEmail.reason,
+      subject: failureEmail.subject,
+      messageId: failureEmail.messageId,
+    });
+    return { failureEmail };
+  } catch (error) {
+    const failureEmailError = errorMessage(error);
+    logError("failure_email_failed", { error: failureEmailError });
+    return { failureEmailError };
+  }
+}
+
+async function runAiJobsAustralia(db: AppDatabase, env: Env): Promise<SourceRunSummary> {
+  const purpose = "daily-aijobs-australia";
+  const location = "Australia";
+  const run = await createJobRun(db, {
+    sourceKey: sourceKeys.aiJobsAustralia,
+    purpose,
+    location,
+    queryPayload: aiJobsAustraliaQueryPayload(env),
+  });
+  logInfo("source_run_started", {
+    sourceKey: sourceKeys.aiJobsAustralia,
+    purpose,
+    location,
+    runId: run.id,
+  });
+
+  try {
+    const fetched = await fetchAiJobsAustraliaApprovedJobs(env);
+    await db
+      .update(schema.jobRuns)
+      .set({ queryPayload: fetched.queryPayload })
+      .where(eq(schema.jobRuns.id, run.id));
+
+    const ingest = await ingestAiJobsAustraliaItems(db, run.id, fetched.items);
+    await finishSuccessfulRun(db, run.id, fetched.rawCount, ingest);
+
+    const summary = sourceRunSummary({
+      ok: true,
+      sourceKey: sourceKeys.aiJobsAustralia,
+      purpose,
+      location,
+      runId: run.id,
+      rawCount: fetched.rawCount,
+      ingest,
+    });
+    logInfo("source_run_completed", summary);
+
+    return summary;
+  } catch (error) {
+    const message = errorMessage(error);
+    await finishJobRun(db, run.id, { status: "failed", error: message });
+    logError("source_run_failed", {
+      sourceKey: sourceKeys.aiJobsAustralia,
+      purpose,
+      location,
+      runId: run.id,
+      error: message,
+    });
+    return {
+      ok: false,
+      sourceKey: sourceKeys.aiJobsAustralia,
+      purpose,
+      location,
+      runId: run.id,
+      error: message,
+    };
+  }
+}
+
+async function runLinkedInCity(
+  db: AppDatabase,
+  env: Env,
+  location: string,
+): Promise<SourceRunSummary> {
+  const purpose = `daily-linkedin-${locationSlug(location)}`;
+  const queryPayload = linkedInCityQueryPayload({ location, count: 200 });
+  const run = await createJobRun(db, {
+    sourceKey: sourceKeys.linkedInJobs,
+    purpose,
+    location,
+    queryPayload,
+  });
+  logInfo("source_run_started", {
+    sourceKey: sourceKeys.linkedInJobs,
+    purpose,
+    location,
+    runId: run.id,
+  });
+
+  try {
+    const fetched = await fetchLinkedInJobsForLocation(env, { location, count: 200 });
+    const ingest = await ingestLinkedInItems(db, run.id, fetched.items);
+    await finishSuccessfulRun(db, run.id, fetched.rawCount, ingest);
+
+    const summary = sourceRunSummary({
+      ok: true,
+      sourceKey: sourceKeys.linkedInJobs,
+      purpose,
+      location,
+      runId: run.id,
+      rawCount: fetched.rawCount,
+      ingest,
+    });
+    logInfo("source_run_completed", summary);
+
+    return summary;
+  } catch (error) {
+    const message = errorMessage(error);
+    await finishJobRun(db, run.id, { status: "failed", error: message });
+    logError("source_run_failed", {
+      sourceKey: sourceKeys.linkedInJobs,
+      purpose,
+      location,
+      runId: run.id,
+      error: message,
+    });
+    return {
+      ok: false,
+      sourceKey: sourceKeys.linkedInJobs,
+      purpose,
+      location,
+      runId: run.id,
+      error: message,
+    };
+  }
+}
+
+async function finishSuccessfulRun(
+  db: AppDatabase,
+  runId: string,
+  rawCount: number,
+  ingest: IngestBatchResult,
+): Promise<void> {
+  await finishJobRun(db, runId, {
     status: "succeeded",
-    rawCount: 0,
-    filteredCount: 0,
-    newCount: 0,
-    changedCount: 0,
-    unchangedCount: 0,
+    rawCount,
+    filteredCount: ingest.total,
+    newCount: ingest.newCount,
+    changedCount: ingest.changedCount,
+    unchangedCount: ingest.unchangedCount,
   });
+}
 
+function sourceRunSummary(input: {
+  ok: true;
+  sourceKey: string;
+  purpose: string;
+  location: string | null;
+  runId: string;
+  rawCount: number;
+  ingest: IngestBatchResult;
+}): SourceRunSummary {
   return {
-    ok: true,
-    status: "not_implemented",
-    runId: run.id,
-    trigger: input.trigger,
-    startedAt: startedAt.toISOString(),
-    scheduledTime,
-    message: "Cron/manual entry point is wired. Scrape, ingest, assess, and email steps are next.",
+    ok: input.ok,
+    sourceKey: input.sourceKey,
+    purpose: input.purpose,
+    location: input.location,
+    runId: input.runId,
+    rawCount: input.rawCount,
+    filteredCount: input.ingest.total,
+    newCount: input.ingest.newCount,
+    changedCount: input.ingest.changedCount,
+    unchangedCount: input.ingest.unchangedCount,
   };
 }
 
-async function loadAdminStatus(env: Env): Promise<unknown> {
+function sumSourceRuns(sourceRuns: SourceRunSummary[], key: keyof SourceRunSummary): number {
+  return sourceRuns.reduce((total, run) => {
+    const value = run[key];
+    return typeof value === "number" ? total + value : total;
+  }, 0);
+}
+
+function countJobSearchQueries(sourceRuns: SourceRunSummary[]): number {
+  return sourceRuns.reduce((total, run) => {
+    if (run.sourceKey === sourceKeys.aiJobsAustralia) return total + 1;
+    if (run.sourceKey === sourceKeys.linkedInJobs) return total + DEFAULT_LINKEDIN_QUERIES.length;
+    return total;
+  }, 0);
+}
+
+function locationSlug(location: string): string {
+  return location.split(",")[0]?.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-") || "unknown";
+}
+
+function parseOptionalInteger(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+async function loadAdminStatus(env: Env): Promise<AdminStatusData> {
   const db = createDatabase(env);
 
   const [lastRun] = await db
@@ -94,6 +451,7 @@ async function loadAdminStatus(env: Env): Promise<unknown> {
       id: schema.jobRuns.id,
       sourceKey: schema.jobRuns.sourceKey,
       purpose: schema.jobRuns.purpose,
+      location: schema.jobRuns.location,
       status: schema.jobRuns.status,
       startedAt: schema.jobRuns.startedAt,
       finishedAt: schema.jobRuns.finishedAt,
@@ -108,13 +466,81 @@ async function loadAdminStatus(env: Env): Promise<unknown> {
     .orderBy(desc(schema.jobRuns.startedAt))
     .limit(1);
 
+  const recentRuns = await db
+    .select({
+      id: schema.jobRuns.id,
+      sourceKey: schema.jobRuns.sourceKey,
+      purpose: schema.jobRuns.purpose,
+      location: schema.jobRuns.location,
+      status: schema.jobRuns.status,
+      startedAt: schema.jobRuns.startedAt,
+      finishedAt: schema.jobRuns.finishedAt,
+      rawCount: schema.jobRuns.rawCount,
+      filteredCount: schema.jobRuns.filteredCount,
+      newCount: schema.jobRuns.newCount,
+      changedCount: schema.jobRuns.changedCount,
+      unchangedCount: schema.jobRuns.unchangedCount,
+      error: schema.jobRuns.error,
+    })
+    .from(schema.jobRuns)
+    .orderBy(desc(schema.jobRuns.startedAt))
+    .limit(12);
+
+  const failedRuns = await db
+    .select({
+      id: schema.jobRuns.id,
+      sourceKey: schema.jobRuns.sourceKey,
+      purpose: schema.jobRuns.purpose,
+      location: schema.jobRuns.location,
+      status: schema.jobRuns.status,
+      startedAt: schema.jobRuns.startedAt,
+      finishedAt: schema.jobRuns.finishedAt,
+      rawCount: schema.jobRuns.rawCount,
+      filteredCount: schema.jobRuns.filteredCount,
+      newCount: schema.jobRuns.newCount,
+      changedCount: schema.jobRuns.changedCount,
+      unchangedCount: schema.jobRuns.unchangedCount,
+      error: schema.jobRuns.error,
+    })
+    .from(schema.jobRuns)
+    .where(eq(schema.jobRuns.status, "failed"))
+    .orderBy(desc(schema.jobRuns.startedAt))
+    .limit(5);
+
   const [listingStats] = await db
     .select({
       total: sql<number>`count(*)`,
       unprocessed: sql<number>`coalesce(sum(case when ${schema.jobListings.processingStatus} = 'unprocessed' then 1 else 0 end), 0)`,
+      processed: sql<number>`coalesce(sum(case when ${schema.jobListings.processingStatus} = 'processed' then 1 else 0 end), 0)`,
+      failed: sql<number>`coalesce(sum(case when ${schema.jobListings.processingStatus} = 'failed' then 1 else 0 end), 0)`,
       pendingEmail: sql<number>`coalesce(sum(case when ${schema.jobListings.emailedAt} is null then 1 else 0 end), 0)`,
+      actionToday: sql<number>`coalesce(sum(case when ${schema.jobListings.fitLabel} = 'action_today' then 1 else 0 end), 0)`,
+      verify: sql<number>`coalesce(sum(case when ${schema.jobListings.fitLabel} = 'verify' then 1 else 0 end), 0)`,
+      peopleRoute: sql<number>`coalesce(sum(case when ${schema.jobListings.fitLabel} = 'people_route' then 1 else 0 end), 0)`,
+      marketIntel: sql<number>`coalesce(sum(case when ${schema.jobListings.fitLabel} = 'market_intel' then 1 else 0 end), 0)`,
+      skip: sql<number>`coalesce(sum(case when ${schema.jobListings.fitLabel} = 'skip' then 1 else 0 end), 0)`,
     })
     .from(schema.jobListings);
+
+  const recentListings = await db
+    .select({
+      id: schema.jobListings.id,
+      sourceKey: schema.jobListings.sourceKey,
+      sourceUrl: schema.jobListings.sourceUrl,
+      title: schema.jobListings.title,
+      companyName: schema.jobListings.companyName,
+      location: schema.jobListings.location,
+      processingStatus: schema.jobListings.processingStatus,
+      fitScore: schema.jobListings.fitScore,
+      fitLabel: schema.jobListings.fitLabel,
+      fitRationale: schema.jobListings.fitRationale,
+      firstSeenAt: schema.jobListings.firstSeenAt,
+      lastSeenAt: schema.jobListings.lastSeenAt,
+      emailedAt: schema.jobListings.emailedAt,
+    })
+    .from(schema.jobListings)
+    .orderBy(desc(schema.jobListings.firstSeenAt))
+    .limit(20);
 
   return {
     ok: true,
@@ -128,17 +554,33 @@ async function loadAdminStatus(env: Env): Promise<unknown> {
     listings: listingStats ?? {
       total: 0,
       unprocessed: 0,
+      processed: 0,
+      failed: 0,
       pendingEmail: 0,
+      actionToday: 0,
+      verify: 0,
+      peopleRoute: 0,
+      marketIntel: 0,
+      skip: 0,
     },
+    recentRuns,
+    failedRuns,
+    recentListings,
   };
 }
 
 async function sendTestEmail(env: Env): Promise<unknown> {
   const sentAt = new Date().toISOString();
+  logInfo("test_email_send_started", { provider: "resend" });
   const result = await sendEmail(env, {
     subject: "Job Finder Agent email test",
     text: `Job Finder Agent sent this test email through Resend.\n\nSent at: ${sentAt}`,
     html: `<p>Job Finder Agent sent this test email through Resend.</p><p>Sent at: ${sentAt}</p>`,
+  });
+  logInfo("test_email_send_completed", {
+    provider: "resend",
+    messageId: result.id,
+    sentAt,
   });
 
   return {
@@ -146,6 +588,27 @@ async function sendTestEmail(env: Env): Promise<unknown> {
     provider: "resend",
     messageId: result.id,
     sentAt,
+  };
+}
+
+async function sendTestFailureEmail(env: Env): Promise<unknown> {
+  const sentAt = new Date().toISOString();
+  logInfo("test_failure_email_send_started", { provider: "resend" });
+  const result = await sendFailureNotification(env, {
+    trigger: "manual-test",
+    status: "test",
+    startedAt: sentAt,
+    finishedAt: sentAt,
+    hardError: "This is a test failure notification from Job Finder Agent.",
+    message: "Testing the error email path. No scrape failed.",
+  });
+  logInfo("test_failure_email_send_completed", result);
+
+  return {
+    ok: !result.failureEmailError,
+    provider: "resend",
+    sentAt,
+    ...result,
   };
 }
 
@@ -165,6 +628,16 @@ export default {
       });
     }
 
+    if (url.pathname === "/admin" || url.pathname === "/admin/") {
+      // This route is intentionally protected outside the Worker by Cloudflare
+      // Access. Keep /health public and configure /admin/* as the Access boundary.
+      try {
+        return htmlResponse(renderAdminPage(await loadAdminStatus(env)));
+      } catch (error) {
+        return htmlResponse(renderAdminErrorPage(errorMessage(error)), { status: 500 });
+      }
+    }
+
     if (url.pathname === "/admin/status") {
       // This route is intentionally protected outside the Worker by Cloudflare
       // Access. Keep /health public and configure /admin/* as the Access boundary.
@@ -178,11 +651,29 @@ export default {
     if (url.pathname === "/admin/run-now") {
       // This route is intentionally protected outside the Worker by Cloudflare
       // Access. Keep /health public and configure /admin/* as the Access boundary.
+      if (request.method !== "POST") {
+        return jsonResponse(
+          { ok: false, error: "Method not allowed. Use POST." },
+          { status: 405, headers: { allow: "POST" } },
+        );
+      }
+
       try {
-        const result = await runDailyJobMonitor(env, { trigger: "manual" });
+        const result = await runDailyJobMonitor(env, {
+          trigger: "manual",
+          adminUrl: new URL("/admin", request.url).toString(),
+        });
         return jsonResponse(result);
       } catch (error) {
-        return jsonResponse({ ok: false, error: errorMessage(error) }, { status: 500 });
+        const message = errorMessage(error);
+        const notification = await sendFailureNotification(env, {
+          trigger: "manual",
+          status: "failed",
+          finishedAt: new Date().toISOString(),
+          hardError: message,
+          message: "Daily job monitor failed before it could return a normal result.",
+        });
+        return jsonResponse({ ok: false, error: message, ...notification }, { status: 500 });
       }
     }
 
@@ -199,7 +690,28 @@ export default {
       try {
         return jsonResponse(await sendTestEmail(env));
       } catch (error) {
-        return jsonResponse({ ok: false, error: errorMessage(error) }, { status: 500 });
+        const message = errorMessage(error);
+        logError("test_email_send_failed", { provider: "resend", error: message });
+        return jsonResponse({ ok: false, error: message }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/admin/test-error-email") {
+      // This route is intentionally protected outside the Worker by Cloudflare
+      // Access. Keep /health public and configure /admin/* as the Access boundary.
+      if (request.method !== "POST") {
+        return jsonResponse(
+          { ok: false, error: "Method not allowed. Use POST." },
+          { status: 405, headers: { allow: "POST" } },
+        );
+      }
+
+      try {
+        return jsonResponse(await sendTestFailureEmail(env));
+      } catch (error) {
+        const message = errorMessage(error);
+        logError("test_failure_email_send_failed", { provider: "resend", error: message });
+        return jsonResponse({ ok: false, error: message }, { status: 500 });
       }
     }
 
@@ -215,8 +727,17 @@ export default {
       runDailyJobMonitor(env, {
         trigger: "cron",
         scheduledTime: controller.scheduledTime,
-      }).catch((error) => {
-        console.error("daily job monitor failed", { error: errorMessage(error) });
+      }).catch(async (error) => {
+        const message = errorMessage(error);
+        logError("daily_job_monitor_failed", { trigger: "cron", error: message });
+        await sendFailureNotification(env, {
+          trigger: "cron",
+          status: "failed",
+          scheduledTime: new Date(controller.scheduledTime).toISOString(),
+          finishedAt: new Date().toISOString(),
+          hardError: message,
+          message: "Daily job monitor failed before it could return a normal result.",
+        });
         throw error;
       }),
     );

@@ -173,13 +173,15 @@ export async function computeLinkedInListing(
   const applyUrl = normalizeNullableUrl(stringValue(item.applyUrl));
   const descriptionText = stringValue(item.descriptionText);
   const descriptionHtml = stringValue(item.descriptionHtml);
+  const postedAtText = dateTextValue(item.postedAt ?? item.postedAtTimestamp);
+  const expiresAtText = dateTextValue(item.expireAt ?? item.expiresAt);
   const contentHash = await computeContentHash({
     sourceKey: sourceKeys.linkedInJobs,
     sourceJobId,
     title,
     companyName,
     location,
-    postedAt: stringValue(item.postedAt ?? item.postedAtTimestamp),
+    postedAt: postedAtText,
     applyUrl,
     descriptionText,
   });
@@ -202,8 +204,8 @@ export async function computeLinkedInListing(
       city: cityFromLocation(location),
       region: regionFromLocation(location),
       country: countryFromLocation(location) ?? "Australia",
-      postedAt: parseDate(stringValue(item.postedAt ?? item.postedAtTimestamp)),
-      expiresAt: parseDate(stringValue(item.expireAt ?? item.expiresAt)),
+      postedAt: parseDate(postedAtText),
+      expiresAt: parseDate(expiresAtText),
       employmentType: stringValue(item.employmentType),
       workplaceType: joinedValue(item.workplaceTypes),
       seniority: stringValue(item.seniorityLevel),
@@ -338,6 +340,19 @@ export async function sha256Hex(value: string): Promise<string> {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function dateTextValue(value: unknown): string | null {
+  const text = stringValue(value);
+  if (text) return text;
+
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  const milliseconds = value > 1_000_000_000_000 ? value : value * 1000;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 function requiredString(value: unknown, label: string): string {
