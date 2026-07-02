@@ -1,5 +1,5 @@
 export type EmailEnv = {
-  RESEND_API_KEY?: string;
+  JOB_FINDER_RESEND_API_KEY?: string;
   SENDER_EMAIL?: string;
   RECIPIENT_EMAIL?: string;
 };
@@ -33,7 +33,7 @@ function requireEnv(env: EmailEnv, key: keyof EmailEnv): string {
 }
 
 export async function sendEmail(env: EmailEnv, input: SendEmailInput): Promise<SendEmailResult> {
-  const apiKey = requireEnv(env, "RESEND_API_KEY");
+  const apiKey = requireEnv(env, "JOB_FINDER_RESEND_API_KEY");
   const from = input.from ?? requireEnv(env, "SENDER_EMAIL");
   const to = input.to ?? requireEnv(env, "RECIPIENT_EMAIL");
 

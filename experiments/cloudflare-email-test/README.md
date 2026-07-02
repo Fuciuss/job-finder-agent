@@ -5,7 +5,7 @@ Small Worker experiment for sending one fixed-recipient test email through Resen
 ## Prerequisites
 
 - The sender domain is verified in Resend, or you are using Resend's sandbox sender/recipient limits.
-- The parent project `.env` contains `RESEND_API_KEY`.
+- The parent project `.env` contains `JOB_FINDER_RESEND_API_KEY`.
 - `wrangler` is installed and logged in.
 
 ## Configure
@@ -24,7 +24,7 @@ RECIPIENT_EMAIL=you@example.com
 TEST_TOKEN=a-long-random-token
 ```
 
-The `dev` script loads both `../../.env` and `.dev.vars`, so `RESEND_API_KEY` can stay in the parent project `.env`.
+The `dev` script loads both `../../.env` and `.dev.vars`, so `JOB_FINDER_RESEND_API_KEY` can stay in the parent project `.env`.
 
 ## Run A Local Real Send
 
@@ -61,7 +61,7 @@ Successful response:
 Set production variables as Worker secrets:
 
 ```bash
-wrangler secret put RESEND_API_KEY
+wrangler secret put JOB_FINDER_RESEND_API_KEY
 wrangler secret put SENDER_EMAIL
 wrangler secret put RECIPIENT_EMAIL
 wrangler secret put TEST_TOKEN

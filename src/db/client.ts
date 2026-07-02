@@ -8,7 +8,7 @@ export type AppDatabase = DrizzleD1Database<typeof schema>;
 export type AppEnv = {
   DB?: D1Database;
   ADMIN_TOKEN?: string;
-  RESEND_API_KEY?: string;
+  JOB_FINDER_RESEND_API_KEY?: string;
   SENDER_EMAIL?: string;
   RECIPIENT_EMAIL?: string;
 };

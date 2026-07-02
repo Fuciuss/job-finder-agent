@@ -86,7 +86,7 @@ export default {
 
       const sender = requireEnv(env, "SENDER_EMAIL");
       const recipient = requireEnv(env, "RECIPIENT_EMAIL");
-      const resendApiKey = requireEnv(env, "RESEND_API_KEY");
+      const resendApiKey = requireEnv(env, "JOB_FINDER_RESEND_API_KEY");
       const body = await request.json().catch(() => ({}));
       const sentAt = new Date().toISOString();
       const subject = body.subject ?? "Resend email test - job-finder-agent";
