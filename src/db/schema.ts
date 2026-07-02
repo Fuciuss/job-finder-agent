@@ -7,6 +7,26 @@ import {
   uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
+/*
+ * Phase 1 design:
+ *
+ * The only dedupe problem this version solves is "do not process the same
+ * listing from the same source more than once." We are deliberately not trying
+ * to prove that a LinkedIn listing and an AI Jobs Australia listing are the same
+ * real-world role yet.
+ *
+ * The stable identity for a listing is:
+ *
+ *   source_id + source_job_id
+ *
+ * Examples:
+ * - linkedin_jobs + 4423994610
+ * - aijobs_australia + 60abacdb-1a29-4288-8485-e59a5cbecbf5
+ *
+ * Re-seeing the same listing should update last_seen_at and create run history,
+ * but it should not trigger another assessment or another email.
+ */
+
 export const jobRunStatuses = ["running", "succeeded", "failed"] as const;
 export const jobListingStatuses = ["active", "ignored", "stale", "closed"] as const;
 export const processingStatuses = ["unprocessed", "processing", "processed", "failed", "skipped"] as const;
@@ -37,6 +57,8 @@ const updatedAt = () =>
     .$defaultFn(now)
     .$onUpdateFn(now);
 
+// Source definitions, not individual runs. Usually one row for LinkedIn Jobs
+// and one row for AI Jobs Australia.
 export const jobSources = sqliteTable("job_sources", {
   id: id(),
   key: text("key").notNull().unique(),
@@ -45,6 +67,8 @@ export const jobSources = sqliteTable("job_sources", {
   createdAt: createdAt(),
 });
 
+// A single scrape/search execution. This is useful for auditability and for
+// knowing which query/payload produced a listing on a given day.
 export const jobRuns = sqliteTable(
   "job_runs",
   {
@@ -79,6 +103,8 @@ export const jobRuns = sqliteTable(
   }),
 );
 
+// The main dedupe table. Each row is one source-specific listing, not a
+// cross-source canonical job.
 export const jobListings = sqliteTable(
   "job_listings",
   {
@@ -88,6 +114,9 @@ export const jobListings = sqliteTable(
       .notNull()
       .references(() => jobSources.id),
 
+    // Must be stable per source. For LinkedIn this is the numeric job ID; for
+    // AI Jobs Australia this is the source UUID. If a future source lacks an ID,
+    // derive one from a normalized source URL hash before inserting.
     sourceJobId: text("source_job_id").notNull(),
     sourceUrl: text("source_url").notNull(),
     normalizedSourceUrl: text("normalized_source_url").notNull(),
@@ -112,9 +141,13 @@ export const jobListings = sqliteTable(
     latestRaw: text("latest_raw", { mode: "json" })
       .$type<Record<string, unknown>>()
       .notNull(),
+    // Hash of stable listing content. Do not include volatile fields like scrape
+    // time, LinkedIn tracking params, or applicant count.
     latestContentHash: text("latest_content_hash").notNull(),
 
     status: text("status", { enum: jobListingStatuses }).notNull().default("active"),
+    // This is the Phase 1 processing gate. Only unprocessed listings should be
+    // assessed and considered for email.
     processingStatus: text("processing_status", { enum: processingStatuses })
       .notNull()
       .default("unprocessed"),
@@ -133,10 +166,12 @@ export const jobListings = sqliteTable(
     updatedAt: updatedAt(),
   },
   (table) => ({
+    // Primary source-local dedupe rule.
     sourceJobUnique: uniqueIndex("job_listings_source_job_unique").on(
       table.sourceId,
       table.sourceJobId,
     ),
+    // Secondary guard for sources where IDs are missing or change unexpectedly.
     sourceUrlUnique: uniqueIndex("job_listings_source_url_unique").on(
       table.sourceId,
       table.normalizedSourceUrl,
@@ -150,6 +185,8 @@ export const jobListings = sqliteTable(
   }),
 );
 
+// Run history join table. This records that an existing listing appeared in a
+// specific run without duplicating the listing itself.
 export const jobRunListings = sqliteTable(
   "job_run_listings",
   {
@@ -173,6 +210,8 @@ export const jobRunListings = sqliteTable(
       .$type<Record<string, unknown>>()
       .notNull(),
 
+    // These flags make daily reporting cheap without needing to compare the
+    // current run to every previous run again.
     isFirstSeen: integer("is_first_seen", { mode: "boolean" }).notNull().default(false),
     isContentChanged: integer("is_content_changed", { mode: "boolean" })
       .notNull()
@@ -191,6 +230,9 @@ export const jobRunListings = sqliteTable(
   }),
 );
 
+// Assessment output for one source listing. Keeping resume/goals/scoring
+// versions in the uniqueness key lets us reassess later without overwriting old
+// decisions.
 export const jobAssessments = sqliteTable(
   "job_assessments",
   {
@@ -234,6 +276,8 @@ export const jobAssessments = sqliteTable(
   }),
 );
 
+// Email sends are stored separately from assessments so the app can know what
+// has already been delivered.
 export const emailBatches = sqliteTable("email_batches", {
   id: id(),
   subject: text("subject").notNull(),
@@ -241,6 +285,9 @@ export const emailBatches = sqliteTable("email_batches", {
   createdAt: createdAt(),
 });
 
+// Phase 1 makes listing_id globally unique in email items, which means one
+// source listing can only be emailed once. If later we want reminder emails,
+// loosen this constraint.
 export const emailBatchItems = sqliteTable(
   "email_batch_items",
   {
