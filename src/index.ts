@@ -1,4 +1,4 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, lt, sql } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
 import { renderAdminErrorPage, renderAdminPage, type AdminStatusData } from "./admin/page.js";
@@ -27,12 +27,27 @@ import {
   linkedInCityQueryPayload,
 } from "./sources/linkedin.js";
 
-type Env = AppEnv;
 type AppDatabase = DrizzleD1Database<typeof schema>;
 
 const SERVICE_NAME = "job-finder-agent";
+const QUEUE_BINDING_NAME = "JOB_FINDER_QUEUE" as const;
+const STALE_RUNNING_RUN_MINUTES = 5;
+const LINKEDIN_JOBS_PER_QUERY = 25;
 
 type DailyJobMonitorTrigger = "cron" | "manual";
+
+type DailyJobMonitorQueueMessage = {
+  type: "run_daily_job_monitor";
+  trigger: DailyJobMonitorTrigger;
+  jobRequestId: string;
+  requestedAt: string;
+  scheduledTime?: number;
+  adminUrl?: string;
+};
+
+type Env = AppEnv & {
+  JOB_FINDER_QUEUE?: Queue<DailyJobMonitorQueueMessage>;
+};
 
 type SourceRunSummary = {
   ok: boolean;
@@ -126,6 +141,8 @@ async function runDailyJobMonitor(
     startedAt: startedAt.toISOString(),
     scheduledTime,
   });
+
+  await failStaleRunningRuns(db, STALE_RUNNING_RUN_MINUTES);
 
   const sourceRuns: SourceRunSummary[] = [];
   sourceRuns.push(await runAiJobsAustralia(db, env));
@@ -238,6 +255,161 @@ async function runDailyJobMonitor(
   return result;
 }
 
+async function enqueueDailyJobMonitor(
+  env: Env,
+  input: {
+    trigger: DailyJobMonitorTrigger;
+    scheduledTime?: number;
+    adminUrl?: string;
+  },
+): Promise<{
+  ok: true;
+  status: "queued";
+  queueBinding: typeof QUEUE_BINDING_NAME;
+  trigger: DailyJobMonitorTrigger;
+  jobRequestId: string;
+  requestedAt: string;
+  scheduledTime?: string;
+  backlogCount: number;
+}> {
+  const queue = getJobFinderQueue(env);
+  const message: DailyJobMonitorQueueMessage = {
+    type: "run_daily_job_monitor",
+    trigger: input.trigger,
+    jobRequestId: crypto.randomUUID(),
+    requestedAt: new Date().toISOString(),
+    scheduledTime: input.scheduledTime,
+    adminUrl: input.adminUrl,
+  };
+  const sent = await queue.send(message, { contentType: "json" });
+
+  const result = {
+    ok: true as const,
+    status: "queued" as const,
+    queueBinding: QUEUE_BINDING_NAME,
+    trigger: message.trigger,
+    jobRequestId: message.jobRequestId,
+    requestedAt: message.requestedAt,
+    scheduledTime: message.scheduledTime ? new Date(message.scheduledTime).toISOString() : undefined,
+    backlogCount: sent.metadata.metrics.backlogCount,
+  };
+
+  logInfo("daily_job_monitor_enqueued", result);
+
+  return result;
+}
+
+async function processDailyJobMonitorQueueMessage(
+  message: Message<DailyJobMonitorQueueMessage>,
+  env: Env,
+): Promise<void> {
+  if (!isDailyJobMonitorQueueMessage(message.body)) {
+    logError("daily_job_monitor_queue_invalid_message", {
+      queueMessageId: message.id,
+      attempts: message.attempts,
+      body: message.body,
+    });
+    message.ack();
+    return;
+  }
+
+  const body = message.body;
+  logInfo("daily_job_monitor_queue_started", {
+    queueMessageId: message.id,
+    attempts: message.attempts,
+    trigger: body.trigger,
+    jobRequestId: body.jobRequestId,
+    requestedAt: body.requestedAt,
+    scheduledTime: body.scheduledTime ? new Date(body.scheduledTime).toISOString() : undefined,
+  });
+
+  try {
+    const result = await runDailyJobMonitor(env, {
+      trigger: body.trigger,
+      scheduledTime: body.scheduledTime,
+      adminUrl: body.adminUrl,
+    });
+    message.ack();
+    logInfo("daily_job_monitor_queue_completed", {
+      queueMessageId: message.id,
+      attempts: message.attempts,
+      trigger: body.trigger,
+      jobRequestId: body.jobRequestId,
+      ok: result.ok,
+      status: result.status,
+    });
+  } catch (error) {
+    const messageText = errorMessage(error);
+    logError("daily_job_monitor_queue_failed", {
+      queueMessageId: message.id,
+      attempts: message.attempts,
+      trigger: body.trigger,
+      jobRequestId: body.jobRequestId,
+      error: messageText,
+    });
+    await sendFailureNotification(env, {
+      trigger: body.trigger,
+      status: "failed",
+      scheduledTime: body.scheduledTime ? new Date(body.scheduledTime).toISOString() : undefined,
+      finishedAt: new Date().toISOString(),
+      hardError: messageText,
+      message: "Queued daily job monitor failed before it could return a normal result.",
+    });
+    message.ack();
+  }
+}
+
+function getJobFinderQueue(env: Env): Queue<DailyJobMonitorQueueMessage> {
+  if (!env.JOB_FINDER_QUEUE) {
+    throw new Error(`${QUEUE_BINDING_NAME} queue binding is not configured.`);
+  }
+
+  return env.JOB_FINDER_QUEUE;
+}
+
+function isDailyJobMonitorQueueMessage(value: unknown): value is DailyJobMonitorQueueMessage {
+  if (!value || typeof value !== "object") return false;
+
+  const candidate = value as Partial<DailyJobMonitorQueueMessage>;
+  return (
+    candidate.type === "run_daily_job_monitor" &&
+    (candidate.trigger === "manual" || candidate.trigger === "cron") &&
+    typeof candidate.jobRequestId === "string" &&
+    typeof candidate.requestedAt === "string" &&
+    (candidate.scheduledTime === undefined || typeof candidate.scheduledTime === "number") &&
+    (candidate.adminUrl === undefined || typeof candidate.adminUrl === "string")
+  );
+}
+
+async function failStaleRunningRuns(db: AppDatabase, staleAfterMinutes: number): Promise<void> {
+  const cutoff = new Date(Date.now() - staleAfterMinutes * 60 * 1000);
+  const staleRuns = await db
+    .select({
+      id: schema.jobRuns.id,
+      sourceKey: schema.jobRuns.sourceKey,
+      purpose: schema.jobRuns.purpose,
+      location: schema.jobRuns.location,
+      startedAt: schema.jobRuns.startedAt,
+    })
+    .from(schema.jobRuns)
+    .where(and(eq(schema.jobRuns.status, "running"), lt(schema.jobRuns.startedAt, cutoff)))
+    .limit(20);
+
+  if (staleRuns.length === 0) return;
+
+  const error = `Marked failed because run was still running after ${staleAfterMinutes} minutes. The Worker invocation was likely canceled before finalization.`;
+
+  for (const run of staleRuns) {
+    await finishJobRun(db, run.id, { status: "failed", error });
+  }
+
+  logError("stale_running_job_runs_failed", {
+    staleAfterMinutes,
+    count: staleRuns.length,
+    runIds: staleRuns.map((run) => run.id),
+  });
+}
+
 async function sendFailureNotification(
   env: Env,
   input: Parameters<typeof sendFailureEmail>[1],
@@ -326,7 +498,7 @@ async function runLinkedInCity(
   location: string,
 ): Promise<SourceRunSummary> {
   const purpose = `daily-linkedin-${locationSlug(location)}`;
-  const queryPayload = linkedInCityQueryPayload({ location, count: 200 });
+  const queryPayload = linkedInCityQueryPayload({ location, count: LINKEDIN_JOBS_PER_QUERY });
   const run = await createJobRun(db, {
     sourceKey: sourceKeys.linkedInJobs,
     purpose,
@@ -341,7 +513,10 @@ async function runLinkedInCity(
   });
 
   try {
-    const fetched = await fetchLinkedInJobsForLocation(env, { location, count: 200 });
+    const fetched = await fetchLinkedInJobsForLocation(env, {
+      location,
+      count: LINKEDIN_JOBS_PER_QUERY,
+    });
     const ingest = await ingestLinkedInItems(db, run.id, fetched.items);
     await finishSuccessfulRun(db, run.id, fetched.rawCount, ingest);
 
@@ -628,7 +803,11 @@ export default {
       });
     }
 
-    if (url.pathname === "/admin" || url.pathname === "/admin/") {
+    if (url.pathname === "/admin") {
+      return Response.redirect(new URL("/admin/", request.url).toString(), 302);
+    }
+
+    if (url.pathname === "/admin/") {
       // This route is intentionally protected outside the Worker by Cloudflare
       // Access. Keep /health public and configure /admin/* as the Access boundary.
       try {
@@ -659,21 +838,15 @@ export default {
       }
 
       try {
-        const result = await runDailyJobMonitor(env, {
+        const result = await enqueueDailyJobMonitor(env, {
           trigger: "manual",
           adminUrl: new URL("/admin", request.url).toString(),
         });
-        return jsonResponse(result);
+        return jsonResponse(result, { status: 202 });
       } catch (error) {
         const message = errorMessage(error);
-        const notification = await sendFailureNotification(env, {
-          trigger: "manual",
-          status: "failed",
-          finishedAt: new Date().toISOString(),
-          hardError: message,
-          message: "Daily job monitor failed before it could return a normal result.",
-        });
-        return jsonResponse({ ok: false, error: message, ...notification }, { status: 500 });
+        logError("daily_job_monitor_enqueue_failed", { trigger: "manual", error: message });
+        return jsonResponse({ ok: false, error: message }, { status: 500 });
       }
     }
 
@@ -724,22 +897,32 @@ export default {
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
-      runDailyJobMonitor(env, {
+      enqueueDailyJobMonitor(env, {
         trigger: "cron",
         scheduledTime: controller.scheduledTime,
       }).catch(async (error) => {
         const message = errorMessage(error);
-        logError("daily_job_monitor_failed", { trigger: "cron", error: message });
+        logError("daily_job_monitor_enqueue_failed", { trigger: "cron", error: message });
         await sendFailureNotification(env, {
           trigger: "cron",
           status: "failed",
           scheduledTime: new Date(controller.scheduledTime).toISOString(),
           finishedAt: new Date().toISOString(),
           hardError: message,
-          message: "Daily job monitor failed before it could return a normal result.",
+          message: "Daily job monitor could not be queued from the cron trigger.",
         });
         throw error;
       }),
     );
   },
-} satisfies ExportedHandler<Env>;
+
+  async queue(
+    batch: MessageBatch<DailyJobMonitorQueueMessage>,
+    env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<void> {
+    for (const message of batch.messages) {
+      await processDailyJobMonitorQueueMessage(message, env);
+    }
+  },
+} satisfies ExportedHandler<Env, DailyJobMonitorQueueMessage>;

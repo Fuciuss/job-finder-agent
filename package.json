@@ -13,6 +13,8 @@
     "db:migrate:local": "bash scripts/cloudflare/apply-d1-migrations.sh local",
     "db:migrate:remote": "bash scripts/cloudflare/apply-d1-migrations.sh remote",
     "db:migrations": "bash scripts/cloudflare/list-d1-migrations.sh remote",
+    "logs:query": "node scripts/cloudflare/query-workers-logs.mjs",
+    "queue:create": "wrangler queues create job-finder-agent-runs",
     "access:plan": "DRY_RUN=1 node scripts/cloudflare/configure-access.mjs",
     "access:configure": "node scripts/cloudflare/configure-access.mjs"
   },

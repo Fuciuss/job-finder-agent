@@ -16,6 +16,17 @@ head_sampling_rate = 1
 # Cloudflare cron uses UTC. 22:00 UTC = 08:00 Australia/Brisbane.
 crons = ["0 22 * * *"]
 
+[[queues.producers]]
+queue = "job-finder-agent-runs"
+binding = "JOB_FINDER_QUEUE"
+
+[[queues.consumers]]
+queue = "job-finder-agent-runs"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 0
+max_concurrency = 1
+
 [[d1_databases]]
 binding = "DB"
 database_name = "job-finder-agent"

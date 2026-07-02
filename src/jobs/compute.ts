@@ -70,6 +70,9 @@ export type ChangedListingUpdates = Pick<
 >;
 
 const LINKEDIN_JOB_ID_RE = /\/jobs\/view\/[^/?#]*-(\d+)(?:[/?#]|$)/;
+const MAX_DESCRIPTION_TEXT_LENGTH = 8_000;
+const MAX_DESCRIPTION_HTML_LENGTH = 8_000;
+const MAX_RAW_STRING_LENGTH = 2_000;
 const TRACKING_PARAMS = new Set([
   "currentJobId",
   "eBP",
@@ -171,8 +174,14 @@ export async function computeLinkedInListing(
   const companyName = stringValue(item.companyName ?? item.company) ?? "Unknown company";
   const location = stringValue(item.location);
   const applyUrl = normalizeNullableUrl(stringValue(item.applyUrl));
-  const descriptionText = stringValue(item.descriptionText);
-  const descriptionHtml = stringValue(item.descriptionHtml);
+  const descriptionText = truncateNullable(
+    stringValue(item.descriptionText),
+    MAX_DESCRIPTION_TEXT_LENGTH,
+  );
+  const descriptionHtml = truncateNullable(
+    stringValue(item.descriptionHtml),
+    MAX_DESCRIPTION_HTML_LENGTH,
+  );
   const postedAtText = dateTextValue(item.postedAt ?? item.postedAtTimestamp);
   const expiresAtText = dateTextValue(item.expireAt ?? item.expiresAt);
   const contentHash = await computeContentHash({
@@ -211,7 +220,7 @@ export async function computeLinkedInListing(
       seniority: stringValue(item.seniorityLevel),
       descriptionText,
       descriptionHtml,
-      rawItem: item,
+      rawItem: compactRawItem(item),
       contentHash,
       firstSeenRunId: runId,
       lastSeenRunId: runId,
@@ -340,6 +349,40 @@ export async function sha256Hex(value: string): Promise<string> {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function truncateNullable(value: string | null, maxLength: number): string | null {
+  if (!value || value.length <= maxLength) return value;
+  return value.slice(0, maxLength);
+}
+
+function compactRawItem(item: RawJobItem): RawJobItem {
+  return Object.fromEntries(
+    Object.entries(item).map(([key, value]) => [key, compactRawValue(key, value)]),
+  );
+}
+
+function compactRawValue(key: string, value: unknown): unknown {
+  if (typeof value === "string") {
+    if (key === "descriptionText") return truncateNullable(value, MAX_DESCRIPTION_TEXT_LENGTH);
+    if (key === "descriptionHtml") return truncateNullable(value, MAX_DESCRIPTION_HTML_LENGTH);
+    return truncateNullable(value, MAX_RAW_STRING_LENGTH);
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((item) => compactRawValue(key, item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([nestedKey, nestedValue]) => [
+        nestedKey,
+        compactRawValue(nestedKey, nestedValue),
+      ]),
+    );
+  }
+
+  return value;
 }
 
 function dateTextValue(value: unknown): string | null {
