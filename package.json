@@ -3,14 +3,24 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --env-file .env",
     "deploy": "wrangler deploy",
-    "check": "wrangler deploy --dry-run"
+    "check": "wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
+    "db:bootstrap": "bash scripts/cloudflare/bootstrap-d1.sh",
+    "db:create": "bash scripts/cloudflare/create-d1.sh",
+    "db:generate": "bash scripts/cloudflare/generate-d1-migration.sh",
+    "db:migrate:local": "bash scripts/cloudflare/apply-d1-migrations.sh local",
+    "db:migrate:remote": "bash scripts/cloudflare/apply-d1-migrations.sh remote",
+    "db:migrations": "bash scripts/cloudflare/list-d1-migrations.sh remote"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.2"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^6.0.3",
     "wrangler": "^4.0.0"
   }
 }

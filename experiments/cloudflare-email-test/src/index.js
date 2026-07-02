@@ -28,12 +28,43 @@ function requireEnv(env, name) {
   return value;
 }
 
+async function sendWithResend({ apiKey, from, to, subject, text, html }) {
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to,
+      subject,
+      text,
+      html,
+    }),
+  });
+
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      result.message ??
+      result.error ??
+      `Resend request failed with status ${response.status}`;
+
+    throw new Error(message);
+  }
+
+  return result;
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "GET") {
       return jsonResponse({
         ok: true,
         service: "job-finder-email-test",
+        provider: "resend",
         usage: "POST with Authorization: Bearer <TEST_TOKEN> to send one fixed-recipient test email.",
       });
     }
@@ -55,19 +86,21 @@ export default {
 
       const sender = requireEnv(env, "SENDER_EMAIL");
       const recipient = requireEnv(env, "RECIPIENT_EMAIL");
+      const resendApiKey = requireEnv(env, "RESEND_API_KEY");
       const body = await request.json().catch(() => ({}));
       const sentAt = new Date().toISOString();
-      const subject = body.subject ?? "Cloudflare Email Service test - job-finder-agent";
+      const subject = body.subject ?? "Resend email test - job-finder-agent";
       const text =
         body.text ??
-        `Cloudflare Email Service test from job-finder-agent.\n\nSent at: ${sentAt}`;
+        `Resend email test from job-finder-agent.\n\nSent at: ${sentAt}`;
       const html =
         body.html ??
-        `<p>Cloudflare Email Service test from <strong>job-finder-agent</strong>.</p><p>Sent at: ${sentAt}</p>`;
+        `<p>Resend email test from <strong>job-finder-agent</strong>.</p><p>Sent at: ${sentAt}</p>`;
 
-      const result = await env.EMAIL.send({
-        to: recipient,
+      const result = await sendWithResend({
+        apiKey: resendApiKey,
         from: sender,
+        to: recipient,
         subject,
         text,
         html,
@@ -75,7 +108,8 @@ export default {
 
       return jsonResponse({
         ok: true,
-        messageId: result.messageId,
+        provider: "resend",
+        messageId: result.id,
         to: recipient,
         from: sender,
         subject,

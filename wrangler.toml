@@ -1,3 +1,18 @@
 name = "job-finder-agent"
 main = "src/index.ts"
 compatibility_date = "2026-07-02"
+account_id = "e2ca6e9ea4072fe37dbb20adff068dab"
+
+[vars]
+SENDER_EMAIL = "notifications@vatican-ticket-notifications.com"
+RECIPIENT_EMAIL = "rees@fucius.ai"
+
+[triggers]
+# Cloudflare cron uses UTC. 22:00 UTC = 08:00 Australia/Brisbane.
+crons = ["0 22 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "job-finder-agent"
+database_id = "97dcc8f5-80c5-4b37-980b-a699141bba64"
+migrations_dir = "drizzle"

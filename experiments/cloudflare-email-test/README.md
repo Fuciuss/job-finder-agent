@@ -1,17 +1,16 @@
-# Cloudflare Email Test
+# Cloudflare Worker Resend Email Test
 
-Small Worker experiment for sending one fixed-recipient test email through Cloudflare Email Service.
+Small Worker experiment for sending one fixed-recipient test email through Resend from a Cloudflare Worker.
 
 ## Prerequisites
 
-- The sender domain is onboarded under Cloudflare Email Service.
-- Cloudflare DNS is authoritative for that domain.
+- The sender domain is verified in Resend, or you are using Resend's sandbox sender/recipient limits.
+- The parent project `.env` contains `RESEND_API_KEY`.
 - `wrangler` is installed and logged in.
-- The recipient is allowed by the account/plan. On free setup, use a verified destination address.
 
 ## Configure
 
-Create local variables:
+Create local Worker variables:
 
 ```bash
 cp .dev.vars.example .dev.vars
@@ -25,14 +24,14 @@ RECIPIENT_EMAIL=you@example.com
 TEST_TOKEN=a-long-random-token
 ```
 
-The `wrangler.toml` email binding has `remote = true`, so `wrangler dev` will send real emails through Cloudflare Email Service.
+The `dev` script loads both `../../.env` and `.dev.vars`, so `RESEND_API_KEY` can stay in the parent project `.env`.
 
 ## Run A Local Real Send
 
 Start the Worker:
 
 ```bash
-wrangler dev
+npm run dev
 ```
 
 In another terminal:
@@ -41,7 +40,7 @@ In another terminal:
 curl -X POST http://localhost:8787 \
   -H "Authorization: Bearer a-long-random-token" \
   -H "Content-Type: application/json" \
-  -d '{"subject":"Cloudflare email test","text":"Hello from the job finder email test."}'
+  -d '{"subject":"Resend email test","text":"Hello from the job finder email test."}'
 ```
 
 Successful response:
@@ -49,10 +48,11 @@ Successful response:
 ```json
 {
   "ok": true,
+  "provider": "resend",
   "messageId": "...",
   "to": "you@example.com",
   "from": "noreply@yourdomain.com",
-  "subject": "Cloudflare email test"
+  "subject": "Resend email test"
 }
 ```
 
@@ -61,6 +61,7 @@ Successful response:
 Set production variables as Worker secrets:
 
 ```bash
+wrangler secret put RESEND_API_KEY
 wrangler secret put SENDER_EMAIL
 wrangler secret put RECIPIENT_EMAIL
 wrangler secret put TEST_TOKEN
