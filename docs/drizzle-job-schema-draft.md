@@ -11,7 +11,7 @@ The schema is intentionally source-local. It does not try to dedupe LinkedIn and
 The dedupe key is:
 
 ```text
-source_id + source_job_id
+source_key + source_job_id
 ```
 
 Examples:
@@ -38,20 +38,13 @@ It uses Drizzle's SQLite/D1 dialect:
 
 ## Tables
 
-### `job_sources`
-
-Stores source definitions such as:
-
-- `linkedin_jobs`
-- `aijobs_australia`
-
 ### `job_runs`
 
 Stores one scrape/search run.
 
 Useful fields:
 
-- source
+- source key
 - purpose
 - location
 - query payload
@@ -68,57 +61,21 @@ This is the main dedupe table.
 Important constraints:
 
 ```text
-unique(source_id, source_job_id)
-unique(source_id, normalized_source_url)
+unique(source_key, source_job_id)
+unique(source_key, normalized_source_url)
 ```
 
 Important state:
 
 - `processing_status`: `unprocessed`, `processing`, `processed`, `failed`, `skipped`
 - `processed_at`
+- fit score/label/rationale
+- `assessed_at`
+- `emailed_at`
 - `first_seen_at`
 - `last_seen_at`
 - `last_changed_at`
-- `latest_content_hash`
-
-### `job_run_listings`
-
-Stores the fact that a listing appeared in a run.
-
-This keeps run history without duplicating the listing itself.
-
-Useful fields:
-
-- run
-- listing
-- input URL
-- matched query
-- raw item
 - content hash
-- first-seen flag
-- content-changed flag
-
-### `job_assessments`
-
-Stores fit scoring and rationale for one source listing.
-
-The uniqueness key is:
-
-```text
-listing_id + assessment_version + resume_version + goals_version
-```
-
-That allows later reassessment if the scoring prompt, resume, or goals change.
-
-### `email_batches`
-
-Stores outbound email sends.
-
-### `email_batch_items`
-
-Stores listings included in emails.
-
-The schema currently makes `listing_id` unique here so a listing can only be emailed once in Phase 1.
 
 ## Ingest Flow
 
@@ -127,19 +84,22 @@ For each returned job:
 1. Identify the source.
 2. Compute `source_job_id`.
 3. Normalize the source URL.
-4. Compute `latest_content_hash`.
-5. Upsert `job_listings` by `(source_id, source_job_id)`.
-6. Insert a `job_run_listings` observation for the run.
-7. If the listing is new, leave `processing_status = "unprocessed"`.
-8. If the listing already exists and content is unchanged, update `last_seen_at` only.
-9. If the listing already exists and content changed, update fields and `last_changed_at`; decide later whether Phase 1 should reprocess changed listings.
-10. Score only listings where `processing_status = "unprocessed"`.
-11. Email only listings that do not already exist in `email_batch_items`.
+4. Compute `content_hash`.
+5. Upsert `job_listings` by `(source_key, source_job_id)`.
+6. If the listing is new, leave `processing_status = "unprocessed"` and store `first_seen_run_id`.
+7. If the listing already exists and content is unchanged, update `last_seen_at` and `last_seen_run_id` only.
+8. If the listing already exists and content changed, update fields and `last_changed_at`; decide later whether Phase 1 should reprocess changed listings.
+9. Score only listings where `processing_status = "unprocessed"`.
+10. Email only listings where `emailed_at is null`.
 
 ## What This Avoids For Now
 
 Phase 1 deliberately avoids:
 
+- source registry table
+- run/listing observation join table
+- separate assessment table
+- email batch tables
 - canonical jobs
 - cross-source matching
 - source-to-source duplicate merging

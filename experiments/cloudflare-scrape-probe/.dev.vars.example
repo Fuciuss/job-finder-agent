@@ -1,0 +1,14 @@
+# All optional — the probe works with no vars set.
+
+# Set to require a bearer token (recommended before you `wrangler deploy` to a
+# public *.workers.dev URL, so the probe isn't left open).
+TEST_TOKEN=replace-with-a-random-test-token
+
+# Provide these to test the cached-config hot path (skips the HTML bootstrap and
+# hits Supabase directly, the way the production Worker will in steady state).
+# Leave unset to exercise the full HTML -> bundle -> config -> Supabase bootstrap.
+# AIJOBS_SUPABASE_URL=https://xxxxxxxx.supabase.co
+# AIJOBS_SUPABASE_ANON_KEY=eyJ...
+
+# Max number of JS chunks to scan for the Supabase config (default 60).
+# MAX_SCRIPTS=60

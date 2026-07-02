@@ -13,3 +13,12 @@ Phase 1 will just be a daily email that alerts me of these new jobs and how appl
 
 ## Considerations
 Deduping across sources
+
+
+
+## Notes
+
+- We are using the rees@fucius.ai Cloudflare account
+
+- I can't seem to send emails from Cloudflare for free so I am going to use Resend
+
