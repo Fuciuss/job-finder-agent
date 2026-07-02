@@ -1,0 +1,7 @@
+name = "job-finder-email-test"
+main = "src/index.js"
+compatibility_date = "2026-07-02"
+
+[[send_email]]
+name = "EMAIL"
+remote = true

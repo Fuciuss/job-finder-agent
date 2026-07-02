@@ -1,0 +1,1 @@
+Whenever the LLM is dumping or writing large pieces of text to a file they should always by default be contained in the 'slop' folder. The majority of the file structure (the 'primary' file structure is reserved for high signal documents and files - these are generally human written)
